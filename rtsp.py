@@ -1,52 +1,86 @@
-
 #http://habrahabr.ru/post/149077/
 #http://heim.ifi.uio.no/~meccano/reflector/smallclient.html
 
-import socket, sys, errno, time, SocketServer
+import socket, sys, time, select, rtp_datagram, rfc2435jpeg
 from base64 import b64encode
-from select import select
 
-def processImage(img):
-    'This function is invoked by the MJPEG Client protocol'
-    # Process image
-    # Just save it as a file in this example
-    f = open('frame.jpg', 'wb')
-    f.write(img)
-    f.close()
-
-def recv_timeout(the_socket,timeout=0.3):
+def recv_timeout2(the_socket):
     the_socket.setblocking(0)
-    total_data=[];data='';begin=time.time()
-    while 1:
-        #if you got some data, then break after wait sec
-        if total_data and time.time()-begin>timeout:
+    total_data=[];data=''
+    while True:
+        r,w,x = select.select([the_socket],[],[],0.1)
+        if len(r)>0:
+            data = r[0].recv(4096)
+            total_data.append(data)
+        else:
             break
-
-        elif time.time()-begin>timeout*2:
-            break
-        try:
-            data=the_socket.recv(8192)
-            if data:
-                total_data.append(data)
-                begin=time.time()
-            else:
-                time.sleep(0.1)
-        except:
-            pass
     return ''.join(total_data)
 
-class RTP(SocketServer.BaseRequestHandler):
+#UDP RECEIVER
+class RTP():
     port = None
     stream = None
+    jpeg = None
+    prevSeq = -1
+    lostPacket = 0
+    save_to = ''
 
-    def handle(self):
-        data = self.request[0].strip()
-        socket = self.request[1]
-        print "{} wrote:".format(self.client_address[0])
-        print data
-
-    def __init__(self,port):
+    def __init__(self,port,save_to):
         self.port = port
+        self.save_to = save_to
+        # Object that deals with JPEGs
+        self.jpeg = rfc2435jpeg.RFC2435JPEG()
+
+    def log(self,msg):
+        print(msg+'\r\n');
+
+    def start(self):
+        self.stream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.stream .bind(('',self.port))
+        self.stream .setblocking(False)
+        self.stream .setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    def recv(self):
+        if not self.stream:
+            self.start()
+
+        rlist,wlist,xlist = select.select([self.stream],[],[],0) #data available?
+        if len(rlist)>0:
+            buf, addr = rlist[0].recvfrom(4096)
+            if len(buf)>0:
+                self.parse(buf)
+
+    def parse(self,buf):
+        rtpdata = rtp_datagram.RTPDatagram()
+        rtpdata.parse(buf)
+
+        # Check for lost packets
+        if self.prevSeq != -1:
+            if (rtpdata.SequenceNumber != self.prevSeq + 1) and rtpdata.SequenceNumber != 0:
+                self.lostPacket = 1
+        self.prevSeq = rtpdata.SequenceNumber
+
+        self.log('RECV RTP: seq=%d, len=%d type=%d' % (rtpdata.SequenceNumber, len(rtpdata.Payload),rtpdata.PayloadType))
+        # Handle Payload
+        if rtpdata.PayloadType == 26: # JPEG compressed video
+            self.jpeg.Datagram = rtpdata.Payload
+            self.jpeg.parse()
+            # Marker = 1 if we just recieved the last fragment
+            if rtpdata.Marker:
+                if not self.lostPacket:
+                    self.jpeg.makeJpeg()
+                    self.save(self.save_to+str(time.time())+'.jpg', self.jpeg.JpegImage)
+                else:
+                    print "RTP packet lost"
+                    self.lostPacket = 0
+                    self.jpeg.JpegPayload = ""
+
+    def save(self,filepath, content):
+        self.log('SAVE: %s' % filepath)
+        f = open(filepath,'wb')
+        f.write(content)
+        f.close()
+
 
 class RTSP:
     stream = None
@@ -119,7 +153,7 @@ class RTSP:
         self.cseq += 1
         return self.cseq
 
-    def send_query(self,command,params={},track=''):
+    def send_query(self,command,params={},track='',post=''):
         s = "%s rtsp://%s%s%s RTSP/1.0\r\n" % (command, self.host,self.path,track)
         s += 'CSeq: %u\r\n' % (self.next_cseq())
         if self.login: s += "Authorization: Basic %s\r\n" % ( b64encode(self.login+':'+self.passw) )
@@ -131,7 +165,14 @@ class RTSP:
         if 'range' in params:
             s += "Range: %s\r\n" % (params['range'])
         s += "User-Agent: Plazmer Rtsp Client\r\n"
+        if post:
+            s += "Content-length: %d\r\n" % len(post)
+
         s += "\r\n"
+
+        if post:
+            s += post
+
         self.log('SENDING QUERY:\r\n%sLen:%d' % (s,len(s)))
 
         totalsent = 0
@@ -146,7 +187,7 @@ class RTSP:
 
     def recv_response(self):
         self.response = None
-        response = recv_timeout(self.stream)
+        response = recv_timeout2(self.stream)
         r = {}
         if not response:
             self.log('NO RESPONSE')
@@ -189,6 +230,12 @@ class RTSP:
     def send_play(self):
         self.send_query('PLAY',{'range':'npt=0-'})
 
+    def send_set_parameter(self,parameter = ''):
+        pass
+
+    def send_get_parameter(self,parameter = ''):
+        self.send_query('GET_PARAMETER',{},'',parameter)
+
     def toHex(self,s):
         lst = []
         for ch in s:
@@ -197,18 +244,13 @@ class RTSP:
             lst.append(hv)
         return reduce(lambda x,y:x+y, lst)
 
-    def start_rtp(self):
-        server1 = SocketServer.UDPServer(('', self.port), RTP)
-        server1.serve_forever()
-        server2 = SocketServer.UDPServer(('', self.port+1), RTP)
-        server2.serve_forever()
-
-config = {'path': '/cam/realmonitor?channel=1&subtype=1',
+config = {'path': '/cam/realmonitor?channel=1&subtype=0',
       'login': 'admin',
       'passw': 'admin',
       'host': '172.16.8.140',
       'port': 554,
-      'udp_port': 2001}
+      'udp_port': 2001,
+      'save_to':'/ramdisk/140.jpg'}
 
 rtsp_client = RTSP(config)
 rtsp_client.connect()
@@ -221,12 +263,18 @@ rtsp_client.recv_response()
 if 'content-type' in rtsp_client.response and rtsp_client.response['content-type'] == 'application/sdp':
     rtsp_client.parse_sdp()
 
+rtsp_client.send_get_parameter('packetization-supported')
+rtsp_client.recv_response()
+
 rtsp_client.send_setup()
 rtsp_client.recv_response()
 
 rtsp_client.send_play()
 rtsp_client.recv_response()
 
-#rtsp_client.start_rtp()
+rtp_client = RTP(config['udp_port'],config['save_to'])
+while True:
+    rtp_client.recv()
+
 
 rtsp_client.disconnect()
