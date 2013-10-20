@@ -1,23 +1,66 @@
-#http://habrahabr.ru/post/149077/
+#Thanx to author of: http://habrahabr.ru/post/117735/,
 #http://heim.ifi.uio.no/~meccano/reflector/smallclient.html
 
-import socket, sys, time, select, rtp_datagram, rfc2435jpeg
+import socket, sys, time, select, rtcp_datagram, rtp_datagram, rfc2435jpeg
 from base64 import b64encode
 
-def recv_timeout2(the_socket):
-    the_socket.setblocking(0)
-    total_data=[];data=''
-    while True:
-        r,w,x = select.select([the_socket],[],[],0.1)
-        if len(r)>0:
-            data = r[0].recv(4096)
-            total_data.append(data)
-        else:
-            break
-    return ''.join(total_data)
+config = {'path': '/cam/realmonitor?channel=1&subtype=1',
+      'login': 'admin',
+      'passw': 'admin',
+      'host': '172.16.8.140',
+      'port': 554,
+      'udp_port': 17654,
+      'save_to':'/ramdisk/cam8.jpg'}
 
-#UDP RECEIVER
-class RTP():
+#RTCP by UDP RECEIVER / REPLY
+
+class RTCP_client:
+    port = None
+    server_port = None
+    server_address = None
+    stream = None
+    rtcp = None
+
+    def __init__(self,port,server_address,server_port):
+      self.port = port
+      self.server_address = server_address
+      self.server_port = server_port
+      self.rtcp = rtcp_datagram.RTCPDatagram()
+
+    def __del__(self):
+        del self.rtcp
+        self.stream.close()
+
+    def log(self,msg):
+        print(msg);
+
+    def start(self):
+        self.stream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.stream.bind(('',self.port))
+        self.stream.setblocking(False)
+        self.stream.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.log('RTCP SERVER STARTED ON %d' % (self.port))
+
+    def recv(self):
+        if not self.stream:
+            self.start()
+        rlist,wlist,xlist = select.select([self.stream],[],[],0) #data available? pls recommend better non-blocking way
+        if len(rlist)>0:
+            buf, addr = rlist[0].recvfrom(4096)
+            if len(buf)>0:
+                self.log('RTCP recv: Len=%d' % (len(buf)))
+                self.parse(buf)
+
+    def parse(self,datagram):
+        self.rtcp.Datagram = datagram
+        self.rtcp.parse()
+        # Send back our Reciever Report
+        # saying that everything is fine
+        RR = self.rtcp.generateRR()
+        self.stream.sendto(RR, (self.server_address, self.server_port))
+
+#RTP by UDP RECEIVER
+class RTP_client():
     port = None
     stream = None
     jpeg = None
@@ -31,23 +74,28 @@ class RTP():
         # Object that deals with JPEGs
         self.jpeg = rfc2435jpeg.RFC2435JPEG()
 
+    def __del__(self):
+        del self.jpeg
+        self.stream.close()
+
     def log(self,msg):
-        print(msg+'\r\n');
+        print(msg);
 
     def start(self):
         self.stream = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.stream .bind(('',self.port))
-        self.stream .setblocking(False)
-        self.stream .setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.stream.bind(('',self.port))
+        self.stream.setblocking(False)
+        self.stream.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.log('RTP SERVER STARTED ON %d' % (self.port))
 
     def recv(self):
         if not self.stream:
             self.start()
-
-        rlist,wlist,xlist = select.select([self.stream],[],[],0) #data available?
+        rlist,wlist,xlist = select.select([self.stream],[],[],0) #data available? wait 1/100 of s
         if len(rlist)>0:
             buf, addr = rlist[0].recvfrom(4096)
             if len(buf)>0:
+                #self.log('RTP recv: Len=%d' % (len(buf)))
                 self.parse(buf)
 
     def parse(self,buf):
@@ -60,7 +108,7 @@ class RTP():
                 self.lostPacket = 1
         self.prevSeq = rtpdata.SequenceNumber
 
-        self.log('RECV RTP: seq=%d, len=%d type=%d' % (rtpdata.SequenceNumber, len(rtpdata.Payload),rtpdata.PayloadType))
+        #self.log('RECV RTP: seq=%d, len=%d type=%d' % (rtpdata.SequenceNumber, len(rtpdata.Payload),rtpdata.PayloadType))
         # Handle Payload
         if rtpdata.PayloadType == 26: # JPEG compressed video
             self.jpeg.Datagram = rtpdata.Payload
@@ -69,7 +117,7 @@ class RTP():
             if rtpdata.Marker:
                 if not self.lostPacket:
                     self.jpeg.makeJpeg()
-                    self.save(self.save_to+str(time.time())+'.jpg', self.jpeg.JpegImage)
+                    self.save(self.save_to, self.jpeg.JpegImage)
                 else:
                     print "RTP packet lost"
                     self.lostPacket = 0
@@ -82,7 +130,7 @@ class RTP():
         f.close()
 
 
-class RTSP:
+class RTSP_client:
     stream = None
     host = None
     port = None
@@ -94,10 +142,12 @@ class RTSP:
     response = None
     sdp = None
     udp_port = 0
-    rtp = None
+    rtcp_server_port = 0
+    rtcp_client_port = 0
+    rtp_client_port = 0
 
+    #state is not implemented
     state = 0 #0 - not connected, 1 - connected rtsp, 2 - rtsp init, 4 - rtsp ready, 8 - rtsp playing
-    debug = 1
 
     def __init__(self,config):
         self.host = config['host']
@@ -108,9 +158,24 @@ class RTSP:
             self.login = config['login']
             self.passw = config['passw']
         self.cseq = 0
+    def __del__(self):
+        if self.stream:
+            self.stream.close()
 
     def log(self,msg):
-        print(msg+'\r\n');
+        print(msg);
+
+    def recv_timeout(self):
+        #the_socket.setblocking(0)
+        total_data=[];data=''
+        while True:
+            r,w,x = select.select([self.stream],[],[],0.05)
+            if len(r)>0:
+                data = r[0].recv(4096)
+                total_data.append(data)
+            else:
+                break
+        return ''.join(total_data)
 
     def connect(self):
         self.stream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -122,12 +187,6 @@ class RTSP:
         self.log('CONNECT: ok')
         return 0
 
-    def disconnect(self):
-        if self.stream:
-            self.stream.close()
-        self.state = 0
-        return 0
-
     def parse_sdp(self):
         data = None
         if self.response and 'content' in self.response:
@@ -135,7 +194,7 @@ class RTSP:
 
         if not data:
             self.sdp = None
-            self.log('NO SDP RESPONSE')
+            self.log('PARSE_SDP: NO SDP RESPONSE')
             return -1
 
         data_arr = data.split('\r\n')
@@ -173,7 +232,7 @@ class RTSP:
         if post:
             s += post
 
-        self.log('SENDING QUERY:\r\n%sLen:%d' % (s,len(s)))
+        self.log('SENDING QUERY: %s Len:%d' % (command,len(s)))
 
         totalsent = 0
         while totalsent < len(s):
@@ -182,12 +241,12 @@ class RTSP:
                 raise RuntimeError("socket connection broken")
             totalsent = totalsent + sent
         if totalsent == len(s):
-            self.log('SEND %d OK' %(totalsent))
+            self.log('SENDING QUERY: %s Len:%d Sent:%d' % (command,len(s),totalsent))
             return 0
 
     def recv_response(self):
         self.response = None
-        response = recv_timeout2(self.stream)
+        response = self.recv_timeout()
         r = {}
         if not response:
             self.log('NO RESPONSE')
@@ -198,6 +257,7 @@ class RTSP:
         if len(tmp)>0:
             r['content'] = tmp[1]
 
+        r['code'] = 0 #default error
         if len(header)>0:
             r['code'] = int( header[0].split(' ')[1] ) #RTSP/1.0 200 OK
 
@@ -210,10 +270,20 @@ class RTSP:
             self.session = r['session'].split(';')[0]
             self.log('SESSION found:%s' % (self.session))
 
+        if 'transport' in r:
+            tr = r['transport'].split(';')
+            for row in tr:
+                ttmp = row.split('=')
+                if len(ttmp)>1: # sample: client_port=5000-5001 server_port=20008-20009
+                    r[ttmp[0]] = ttmp[1].split('-')
+            self.rtp_client_port = int(r['client_port'][0])
+            self.rtcp_client_port = int(r['client_port'][1])
+            self.rtcp_server_port = int(r['server_port'][1])
+
         if 'cseq' in r:
             self.cseq = int(r['cseq'])
 
-        self.log('RECV RESPONSE:\r\n%sLEN:%d' % (response,len(response)))
+        self.log('RECV RESPONSE: code=%d Len:%d' % (r['code'], len(response)))
         self.response = r
         return r
 
@@ -230,51 +300,69 @@ class RTSP:
     def send_play(self):
         self.send_query('PLAY',{'range':'npt=0-'})
 
+    def send_teardown(self):
+        self.send_query('TEARDOWN');
+
     def send_set_parameter(self,parameter = ''):
-        pass
+        self.send_query('SET_PARAMETER',{},'',parameter)
 
     def send_get_parameter(self,parameter = ''):
         self.send_query('GET_PARAMETER',{},'',parameter)
 
-    def toHex(self,s):
-        lst = []
-        for ch in s:
-            hv = hex(ord(ch)).replace('0x', '')
-            if len(hv) == 1: hv = '0'+hv
-            lst.append(hv)
-        return reduce(lambda x,y:x+y, lst)
+    def rtsp_start(self):
+        if not self.stream:
+            self.connect()
 
-config = {'path': '/cam/realmonitor?channel=1&subtype=0',
-      'login': 'admin',
-      'passw': 'admin',
-      'host': '172.16.8.140',
-      'port': 554,
-      'udp_port': 2001,
-      'save_to':'/ramdisk/140.jpg'}
+        self.send_options()
+        resp = self.recv_response()
 
-rtsp_client = RTSP(config)
-rtsp_client.connect()
+        self.send_describe()
+        self.recv_response()
+        if 'content-type' in self.response and \
+            self.response['content-type'] == 'application/sdp':
+            self.parse_sdp()
 
-rtsp_client.send_options()
-resp = rtsp_client.recv_response()
+        self.send_setup()
+        self.recv_response()
 
-rtsp_client.send_describe()
-rtsp_client.recv_response()
-if 'content-type' in rtsp_client.response and rtsp_client.response['content-type'] == 'application/sdp':
-    rtsp_client.parse_sdp()
+        self.send_play()
+        self.recv_response()
+        if self.response['code'] == 200:
+            return True
+        else:
+            return False
 
-rtsp_client.send_get_parameter('packetization-supported')
-rtsp_client.recv_response()
-
-rtsp_client.send_setup()
-rtsp_client.recv_response()
-
-rtsp_client.send_play()
-rtsp_client.recv_response()
-
-rtp_client = RTP(config['udp_port'],config['save_to'])
+#main loop
 while True:
-    rtp_client.recv()
+    try:
+        start_time = time.time()
+        current_time = time.time()
 
+        rtsp_client = RTSP_client(config)
+        rtsp_client.rtsp_start()
 
-rtsp_client.disconnect()
+        if rtsp_client.rtp_client_port: #if setup rtsp command and responsse - ok
+            print('PORTS: rtp %d, rtsp client %d, rtsp server %d' % (\
+                    rtsp_client.rtp_client_port,\
+                    rtsp_client.rtcp_client_port,\
+                    rtsp_client.rtcp_server_port ))
+            rtp_client = RTP_client(rtsp_client.rtp_client_port, config['save_to'])
+            rtcp_client = RTCP_client(rtsp_client.rtcp_client_port, config['host'], rtsp_client.rtcp_server_port)
+
+            while current_time - start_time < 60: #60 sec, then reconnect by rtsp
+                rtp_client.recv() #and save jpeg
+                rtcp_client.recv() #and send reply
+                current_time = time.time()
+
+            del rtp_client
+            del rtcp_client
+
+        del rtsp_client
+        start_time = time.time()
+    except KeyboardInterrupt as e:
+        print >>sys.stderr, e.message
+        sys.exit(0)
+    except Exception as e:
+        print >>sys.stderr, e.message
+        pass
+
